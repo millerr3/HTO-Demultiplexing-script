@@ -1,0 +1,131 @@
+library(Seurat)
+library(tidyverse)
+options(error = function() traceback(3))
+# load barcode matrices
+cells.features <- Read10X('/Volumes/kovats-lab/millerr/ARKO_Homeostasis_111022/ARKO_Homeostasis_matrix/outs/per_sample_outs/ARKO_Homeostasis_matrix/count/sample_filtered_feature_bc_matrix/')
+cells.htos <- cells.features[["Antibody Capture"]]
+cells.umis <- cells.features[["Gene Expression"]]
+
+# select cell barcodes detected in both RNA and HTO readings
+joint.bcs <- intersect(colnames(cells.htos), colnames(cells.umis))
+
+# Subset RNA and HTO counts by joint cell barcodes
+cells.umis <- cells.umis[, joint.bcs]
+cells.htos <- as.matrix(cells.htos[, joint.bcs])
+
+#check for HTO sample row names
+rownames(cells.htos)
+
+##Setup Seurat object and add in HTO data
+#Seurat object
+cells.hashtag <- CreateSeuratObject(counts = cells.umis)
+
+#Normalize RNA data with log normalization
+cells.hashtag <- NormalizeData(cells.hashtag)
+
+#Find and scale variable features
+cells.hashtag <- FindVariableFeatures(cells.hashtag, selection.method = "mean.var.plot")
+cells.hashtag <- ScaleData(cells.hashtag, features = VariableFeatures(cells.hashtag))
+
+#Add HTO data as new assay independent of RNA
+cells.hashtag[["HTO"]] <- CreateAssayObject(counts = cells.htos)
+
+#Normalize HTO data using centered log-ratio transformation
+cells.hashtag <- NormalizeData(cells.hashtag, assay = "HTO", normalization.method = "CLR")
+
+#Demultiplex cells based on HTO enrichment
+cells.hashtag <- HTODemux(cells.hashtag, assay = "HTO", positive.quantile = 0.99)
+
+#Visualize demultiplexing results
+#Global classification results
+table(cells.hashtag$HTO_classification.global)
+
+                                                                                                                                                          ##Ridge plots
+#Group cells based on HTO signal
+Idents(cells.hashtag) <- "HTO_maxID"
+RidgePlot(cells.hashtag, assay = "HTO", features = rownames(cells.hashtag[["HTO"]])[1:3], ncol = 3)
+
+#Pairs of HTO signals
+FeatureScatter(cells.hashtag, feature1 = "hto_HTO-TotalSeq-A0301", feature2 = "hto_HTO-TotalSeq-A0302")
+
+##Compare UMIs for singlets, doublets, and negatives
+Idents(cells.hashtag) <- "HTO_classification.global"
+VlnPlot(cells.hashtag, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+
+cells.hashtag.subset <- subset(cells.hashtag, idents = "Negative", invert = TRUE)
+DefaultAssay(cells.hashtag.subset) <- "HTO"
+cells.hashtag.subset <- ScaleData(cells.hashtag.subset, features = rownames(cells.hashtag.subset), verbose = FALSE)
+cells.hashtag.subset <- RunPCA(cells.hashtag.subset, features = rownames(cells.hashtag.subset), approx = FALSE)
+#cells.hashtag.subset <- RunTSNE(cells.hashtag.subset, dims = 1:3, perplexity = 100)
+#DimPlot(cells.hashtag.subset)
+
+#HTO heatmap
+HTOHeatmap(cells.hashtag.subset, assay = "HTO", ncells = 2000)
+
+#Extract the singlets
+cells.singlet <- subset(cells.hashtag, idents = "Singlet")
+cat("just create cells.singlet")
+print(cells.singlet)
+#Select top 1000 most variable features
+cells.singlet <- FindVariableFeatures(cells.singlet, selection.method = "mean.var.plot")
+
+#Scale variable features for RNA data
+cells.singlet <- ScaleData(cells.singlet, features = VariableFeatures(cells.singlet))
+
+#Run PCA
+cells.singlet <- RunPCA(cells.singlet, features = VariableFeatures(cells.singlet))
+
+# We select the top 10 PCs for clustering and tSNE based on PCElbowPlot
+cells.singlet <- FindNeighbors(cells.singlet, reduction = "pca", dims = 1:15)
+cells.singlet <- FindClusters(cells.singlet, resolution = 0.2, verbose = FALSE)
+cells.singlet <- RunTSNE(cells.singlet, reduction = "pca", dims = 1:15)
+cells.singlet <- RunUMAP(cells.singlet, dims = 1:15)
+
+# Projecting singlet identities on TSNE and UMAP visualization
+DimPlot(cells.singlet, group.by = "HTO_classification")
+DimPlot(cells.singlet, group.by = "seurat_clusters")
+DimPlot(cells.singlet, group.by = c("HTO_classification", "seurat_clusters"))
+DimPlot(cells.singlet, reduction = "umap", group.by = c("HTO_classification", "seurat_clusters"))
+
+
+seurat_object <- CreateSeuratObject(assay = "RNA", counts = cells.umis)
+# mt reads and filtering
+seurat_object[["percent.mt"]] <- PercentageFeatureSet(cells.singlet, pattern = "^mt-")
+view(seurat_object@meta.data)
+VlnPlot(seurat_object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+FeatureScatter(seurat_object, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_smooth(method = 'lm')
+seurat_object <- subset(seurat_object, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & 
+                          percent.mt < 10)
+
+
+seurat_object[["percent.rp"]] <- PercentageFeatureSet(cells.singlet, pattern = "^Rp*")
+view(seurat_object@meta.data)
+
+# normalization and top 10 variable identification
+seurat_object <- NormalizeData(cells.singlet)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(seurat_object), 10)
+
+# variable features plot
+plot1 <- print(VariableFeaturePlot(seurat_object)) 
+LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+#PCA and UMAP
+all.genes <- rownames(seurat_object)
+seurat_object <- ScaleData(seurat_object, features = all.genes)
+seurat_object <- RunPCA(seurat_object, features = VariableFeatures(object = seurat_object))
+print(seurat_object[["pca"]], dims = 1:5, nfeatures = 5)
+DimHeatmap(seurat_object, dims = 1:5, cells = 500, balanced = TRUE)
+ElbowPlot(seurat_object)
+seurat_object <- FindNeighbors(seurat_object, dims = 1:10)
+seurat_object <- FindClusters(seurat_object, resolution = 0.4)
+View(seurat_object@meta.data)
+DimPlot(seurat_object, group.by = "RNA_snn_res.0.4", label = TRUE)
+seurat_object <- RunUMAP(seurat_object, dims = 1:10)
+DimPlot(seurat_object, reduction = "umap", label = TRUE)
+DimPlot(seurat_object, reduction = "umap", group.by = "HTO_maxID", cols = c("red", "blue", "orange"))
+DimPlot(seurat_object, reduction = "umap", group.by = c("HTO_maxID", "seurat_clusters"))
+
+All_Markers <-FindAllMarkers(cells.singlet, logfc.threshold = 0.25, min.pct = 0.25, only.pos = FALSE, test.use = 'DESeq2',  slot = 'counts')
+write.csv(All_Markers, "All_Markers.csv", row.names = TRUE)
